@@ -1,0 +1,647 @@
+# outbound-sdr — Outbound SDR operation (GTM → offering → campaign → sequence → reply → meeting)
+#
+# An autonomous outbound sales-development team. See PRD.md for the full
+# design (each agent's pre_compose / chain / compose / intelligence
+# rationale, tools, integrations). Read that first.
+#
+# THE SHAPE: a GTM head researches the onboarded company and owns the
+# go-to-market strategy; an offering builder turns strategy ideas into
+# sellable offerings; a campaign strategist (human- or owner-initiated)
+# sources leads (Apollo), has them hyper-personalised into multi-step
+# sequences (the enrichment agent's looping tool does the heavy lifting),
+# ships them through a sequencer (EmailBison/Instantly), then replies are
+# pulled, classified, and worked by a human to a booked meeting.
+#
+# EMAIL-DRIVEN. Self-reliant agents (see .claude skill — pre_compose to
+# gather, chain to finish, compose to hand off, intelligence to read a
+# connector). Systems of record stay in YOUR tools; connectors ship
+# inert (env-var) with a local dev store so the LLM chain runs day-0.
+
+name: "outbound-sdr"
+version: "1.0.0"
+architecture: "managed_mesh"
+environment: "development"
+debug: true
+log_level: "INFO"
+
+redis:
+  host: "${REDIS_HOST:localhost}"
+  port: ${REDIS_PORT:6379}
+  db: 0
+  password: "${REDIS_PASSWORD:}"
+  auto_storage: true
+  decode_responses: true
+  default_ttl: 86400
+  session_ttl: 2592000          # 30d — campaigns are long-lived
+
+auto_discover:
+  directory: "./agency"
+  pattern: "*_agent.py"
+  recursive: false
+
+manager:
+  enabled: true
+  model: "gpt-4o-mini"
+  domain: "generic"
+  can_intervene: true
+  prompt: |
+    Outbound SDR operation. The motion:
+      - gtm_strategist researches the company and owns the GTM doc;
+        weekly it appends ideas/events or spins a new GTM on a shift,
+        and promotes offering-worthy ideas to the offering builder
+      - offering_builder turns ideas into offerings with A/B × persona
+        × industry variants
+      - campaign_strategist (human/owner-initiated) assembles a campaign,
+        sources leads (Apollo), drives enrichment, ships via the sequencer
+      - lead_enrichment writes hyper-personalised multi-step sequences —
+        its TOOL loops every lead × step to completion
+      - replies are pulled, classified, and worked by a human to a meeting
+    Escalate when:
+      - a new/changed GTM is unreviewed > 24h
+      - a campaign is pending approval > 24h
+      - enrichment stalls (sequences incomplete after the loop budget)
+  routing:
+    mode: "learning"
+    confidence_threshold: 0.7
+    fallback: "all"
+  knowledge:
+    serviceName: "mongo_main"
+    enabled: true
+    groupName: "gtm_playbook"
+
+mesh:
+  call_timeout: 300            # research + enrichment are long-running
+
+# ─────────────────────────────────────────────────────────────────────
+# DATA STRUCTURES (see PRD §3 for full shapes)
+# ─────────────────────────────────────────────────────────────────────
+data_structures:
+  CompanyOnboarding:
+    type: "object"
+    properties:
+      company_name: { type: "string" }
+      website:      { type: "string" }
+      linkedin:     { type: "string" }
+      extra:        { type: "object" }
+    required: ["company_name"]
+
+# ─────────────────────────────────────────────────────────────────────
+# ENTRY POINTS
+# ─────────────────────────────────────────────────────────────────────
+entry_points:
+  - name: "onboard_company"
+    target: "gtm_strategist_agent"
+    description: "A company is onboarded (mesh request: name, website, linkedin, …)"
+
+  - name: "weekly_gtm_sweep"
+    target: "gtm_strategist_agent"
+    description: "Mon 07:00 cron — find market events/ideas, append or spin a new GTM"
+
+  - name: "weekly_offering_sweep"
+    target: "offer_architect_agent"
+    description: "Mon 08:00 cron — build offerings for ideas that lack one"
+
+  - name: "start_campaign"
+    target: "campaign_strategist_agent"
+    description: "Human inbox: run a campaign for a given GTM + offering"
+
+  - name: "pull_replies"
+    target: "inbox_monitor_agent"
+    description: "Every 15 min — pull new replies from the mailbox/sequencer"
+
+  # ── Direct-call doors (debug / replay / programmatic) ──
+  - name: "direct_call_gtm"
+    target: "gtm_strategist_agent"
+    description: "Run GTM research/maintenance directly"
+  - name: "direct_call_offering"
+    target: "offer_architect_agent"
+    description: "Build one offering directly"
+  - name: "direct_call_campaign"
+    target: "campaign_strategist_agent"
+    description: "Assemble one campaign directly"
+  - name: "direct_call_prospector"
+    target: "prospector_agent"
+    description: "Pull a lead list directly (Apollo)"
+  - name: "direct_call_outreach_writer"
+    target: "outreach_writer_agent"
+    description: "Run enrichment on a sourced list directly"
+
+# ─────────────────────────────────────────────────────────────────────
+# AGENTS
+# ─────────────────────────────────────────────────────────────────────
+agents:
+
+  # ── 4.1 GTM STRATEGIST — team head (LLM) ────────────────────────
+  gtm_strategist_agent:
+    name: "gtm_strategist_agent"
+    agent_type: "llm"
+    description: "Team head — researches the onboarded company and owns the GTM doc; weekly appends ideas or spins a new GTM; promotes offering-worthy ideas"
+    model: "claude-sonnet-4-6"
+    temperature: 0.3
+    max_completion_tokens: 4000
+    communication_type: "chain"
+    wake_up: "0 7 * * 1"               # Mon 07:00 — weekly idea/event sweep
+    thinking: true
+    thinking_budget: 6000
+    prompt: |
+      You are the GTM head for the onboarded company. context["prepared_data"]
+      carries the company record AND every existing GTM doc (pre_compose
+      already pulled them) — reason over what already exists.
+
+      Responsibility 1 — RESEARCH. Use your tools (web_research,
+      find_market_events) to build a market thesis + ICP + a set of
+      ideas. Go deep; call tools as many times as needed.
+
+      Responsibility 2 — MAINTAIN THE GTM. Decide per idea: does it
+      APPEND to an existing GTM (same strategy), or does the strategy
+      itself shift enough to warrant a NEW GTM? Set gtm_changed=true
+      ONLY for a new/materially-changed strategy.
+
+      Responsibility 3 — PROMOTE. Mark ideas worth elaborating into an
+      offering with is_offering_candidate=true; list their ids in
+      offering_candidate_ids. Do NOT promote every idea — only ones with
+      a clear offering angle.
+
+      Deterministic rules: idea_count = number of ideas in this run;
+      echo company_id from the input. The append-vs-new WRITE happens in
+      your post-processor — you decide, it persists.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly
+      these keys:
+      {"gtm_id": "", "gtm_changed": false, "has_offering_candidate": false, "offering_candidate_ids": [], "market_thesis": "", "idea_count": 0, "version": 0, "company_id": ""}
+    enforce_yields: true
+    enforce_yields_retry: 2
+    tools: ["web_research", "find_market_events"]
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "gtm_playbook"
+    yields:
+      gtm_id: "string"
+      gtm_changed: "boolean"
+      has_offering_candidate: "boolean"
+      offering_candidate_ids: "list"
+      market_thesis: "string"
+      idea_count: "number"
+      version: "number"
+      company_id: "string"
+    inputs:
+      company_name: "string"
+      website: "string"
+      linkedin: "string"
+    can_call:
+      # New/changed strategy → human sign-off before it drives offerings
+      - agent: "growth_lead_human"
+        condition: "calling_agent_response.gtm_changed == true"
+      # Flagged offering idea on a stable GTM → build the offering
+      - agent: "offer_architect_agent"
+        condition: "calling_agent_response.has_offering_candidate == true and calling_agent_response.gtm_changed == false"
+      # Otherwise record the run
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.has_offering_candidate == false and calling_agent_response.gtm_changed == false"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.2 OFFERING BUILDER (LLM) ──────────────────────────────────
+  offer_architect_agent:
+    name: "offer_architect_agent"
+    agent_type: "llm"
+    description: "Turns a strategy idea into a structured offering with A/B × persona × industry variants"
+    model: "claude-sonnet-4-6"
+    temperature: 0.4
+    max_completion_tokens: 4000
+    communication_type: "chain"
+    wake_up: "0 8 * * 1"               # Mon 08:00 — build offerings for unbuilt ideas
+    prompt: |
+      You turn a GTM idea into a sellable, message-ready OFFERING.
+      context["prepared_data"] carries the flagged idea(s) + parent GTM
+      (pre_compose pulled ideas that lack an offering).
+
+      Build the offering: name, description, the industry it serves,
+      the pains it solves, the solution, the business outcomes, and the
+      likely objections.
+
+      Then build VARIANTS — multiple per idea: A/B angle × persona ×
+      industry. Keep several in hand so campaigns can draw from them.
+      variant_count = number of variants produced.
+
+      Echo idea_id and company_id. The WRITE happens in your
+      post-processor (persist_offering).
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly
+      these keys:
+      {"offering_id": "", "idea_id": "", "name": "", "industry": "", "variant_count": 0, "ready_for_campaign": false, "company_id": ""}
+    enforce_yields: true
+    enforce_yields_retry: 2
+    yields:
+      offering_id: "string"
+      idea_id: "string"
+      name: "string"
+      industry: "string"
+      variant_count: "number"
+      ready_for_campaign: "boolean"
+      company_id: "string"
+    inputs:
+      idea_id: "string"
+    can_call:
+      # Offerings do NOT auto-launch campaigns — record and stop.
+      - agent: "audit_logger_agent"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.3 CAMPAIGN STRATEGIST — the conductor (LLM) ───────────────
+  campaign_strategist_agent:
+    name: "campaign_strategist_agent"
+    agent_type: "llm"
+    description: "Conductor — assembles a campaign from GTM + offering, then drives sourcing → enrichment → upload"
+    model: "claude-sonnet-4-6"
+    temperature: 0.3
+    max_completion_tokens: 3000
+    communication_type: "chain"
+    prompt: |
+      You assemble and drive an outbound campaign. context["prepared_data"]
+      carries the named GTM + offering + variants (pre_compose pulled them).
+
+      Define the campaign: ICP filter, target size, sequence shape
+      (how many email steps + LinkedIn), and which offering variants to
+      use. Use assemble_campaign to lock the plan.
+
+      requires_approval defaults TRUE — a human approves spend + brand
+      before anything sends. Set approved from the human's decision on
+      a resume; on first pass leave approved=false.
+
+      Echo gtm_id, offering_id, company_id.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly
+      these keys:
+      {"campaign_id": "", "gtm_id": "", "offering_id": "", "target_size": 0, "sequence_shape": "", "requires_approval": true, "approved": false, "company_id": ""}
+    enforce_yields: true
+    enforce_yields_retry: 2
+    tools: ["assemble_campaign"]
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "gtm_playbook"
+    yields:
+      campaign_id: "string"
+      gtm_id: "string"
+      offering_id: "string"
+      target_size: "number"
+      sequence_shape: "string"
+      requires_approval: "boolean"
+      approved: "boolean"
+      company_id: "string"
+    inputs:
+      gtm_id: "string"
+      offering_id: "string"
+    can_call:
+      # Default send gate — approve spend + brand before sourcing fires
+      - agent: "sales_lead_human"
+        condition: "calling_agent_response.requires_approval == true and calling_agent_response.approved == false"
+      # Approved → source the leads
+      - agent: "prospector_agent"
+        condition: "calling_agent_response.approved == true"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.4 LEAD SOURCING (SYSTEM — Apollo MCP) ─────────────────────
+  prospector_agent:
+    name: "prospector_agent"
+    agent_type: "programmatic"
+    description: "Pulls + validates the target lead list from Apollo (prospect system of record)"
+    communication_type: "chain"
+    integration: "mcp"
+    connector_config:
+      transport: "http"
+      url: "${APOLLO_MCP_URL:}"          # set when you wire Apollo
+      tool_name: "search_people"
+    yields:
+      list_id: "string"
+      campaign_id: "string"
+      lead_count: "number"
+      leads: "list"
+      validated: "boolean"
+    inputs:
+      campaign_id: "string"
+      icp_filter: "object"
+      target_size: "number"
+    can_call:
+      - agent: "outreach_writer_agent"
+        condition: "calling_agent_response.lead_count > 0"
+      # No leads → halt + log. The campaign owner re-runs start_campaign
+      # with a wider ICP. (Routing back to the conductor re-fired
+      # sourcing endlessly — a real loop, removed.)
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.lead_count == 0"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.5 LEAD ENRICHMENT — sequence writer (LLM + LOOPING TOOL) ──
+  outreach_writer_agent:
+    name: "outreach_writer_agent"
+    agent_type: "llm"
+    description: "Writes a hyper-personalised multi-step sequence (email 1/2/3 + LinkedIn) per lead; its tool loops every lead × step to completion"
+    model: "claude-sonnet-4-6"
+    temperature: 0.5
+    max_completion_tokens: 2000
+    communication_type: "chain"
+    prompt: |
+      You write outbound sequences, one step at a time. The TOOL drives;
+      you write.
+
+      Loop: call next_enrichment_task to get the next
+      {lead, step_no, channel, prior_steps}. Write THAT one step —
+      subject (email) + body — grounded in the lead's enrichment and
+      consistent with prior_steps (same thread, escalating, not "way too
+      different"). Call write_sequence_step to persist it. Repeat until
+      next_enrichment_task returns done=true. THE JOB IS NOT FINISHED
+      until every lead × every step is written — keep going.
+
+      Hyper-personalise: cite something specific about the lead/company.
+      No generic templates.
+
+      When done, call enrichment_status and report.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly
+      these keys:
+      {"campaign_id": "", "leads_enriched": 0, "sequences_written": 0, "all_sequences_complete": false}
+    enforce_yields: true
+    enforce_yields_retry: 1
+    tools: ["next_enrichment_task", "write_sequence_step", "enrichment_status"]
+    yields:
+      campaign_id: "string"
+      leads_enriched: "number"
+      sequences_written: "number"
+      all_sequences_complete: "boolean"
+    inputs:
+      campaign_id: "string"
+      list_id: "string"
+    can_call:
+      # Sequences written → ship them. Forward to the launcher directly
+      # (self-reliant: the writer finishes its job and hands off; it does
+      # NOT route back to the conductor — that created an infinite
+      # re-sourcing loop).
+      - agent: "campaign_launcher_agent"
+        condition: "calling_agent_response.all_sequences_complete == true"
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.all_sequences_complete == false"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.6 SEQUENCE UPLOADER (SYSTEM — sequencer MCP) ──────────────
+  campaign_launcher_agent:
+    name: "campaign_launcher_agent"
+    agent_type: "programmatic"
+    description: "Pushes built sequences into the email sequencer (EmailBison / Instantly)"
+    communication_type: "chain"
+    integration: "mcp"
+    connector_config:
+      transport: "http"
+      url: "${SEQUENCER_MCP_URL:}"
+      tool_name: "upload_campaign"
+    # Native SMTP send (optional) — the SEQUENCER_MCP_URL connector is the
+    # default send path. Uncomment + fill from_address/smtp_host in .env to
+    # send directly instead.
+    # channels:
+    #   email:
+    #     from_address: "${FROM_ADDRESS:}"
+    #     smtp_host: "${SMTP_HOST:}"
+    #     smtp_port: ${SMTP_PORT:587}
+    #     smtp_user: "${SMTP_USER:}"
+    #     smtp_password: "${SMTP_PASSWORD:}"
+    yields:
+      campaign_id: "string"
+      sequencer_ref: "string"
+      scheduled_count: "number"
+      upload_ok: "boolean"
+    inputs:
+      campaign_id: "string"
+    can_call:
+      - agent: "records_keeper_agent"
+      - agent: "audit_logger_agent"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.7 REPLY PULLER (SYSTEM — mailbox MCP, cron) ───────────────
+  inbox_monitor_agent:
+    name: "inbox_monitor_agent"
+    agent_type: "programmatic"
+    description: "Pulls new replies from the mailbox / sequencer"
+    communication_type: "chain"
+    integration: "mcp"
+    connector_config:
+      transport: "http"
+      url: "${MAILBOX_MCP_URL:}"
+      tool_name: "fetch_replies"
+    # wake_up: "*/15 * * * *"           # enable after wiring your mailbox connector
+    # Native IMAP ingest (optional) — the MAILBOX_MCP_URL connector is the
+    # default reply-ingest path. Uncomment + fill in .env to pull directly.
+    # channels:
+    #   email:
+    #     from_address: "${FROM_ADDRESS:}"
+    #     imap_host: "${IMAP_HOST:}"
+    #     imap_user: "${IMAP_USER:}"
+    #     imap_password: "${IMAP_PASSWORD:}"
+    yields:
+      replies: "list"
+      reply_count: "number"
+    inputs:
+      since: "string"
+    can_call:
+      - agent: "reply_triager_agent"
+        condition: "calling_agent_response.reply_count > 0"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.8 REPLY CLASSIFIER (LLM) ──────────────────────────────────
+  reply_triager_agent:
+    name: "reply_triager_agent"
+    agent_type: "llm"
+    description: "Classifies each reply and proposes an action + draft response"
+    model: "gpt-4o-mini"
+    temperature: 0.2
+    communication_type: "chain"
+    prompt: |
+      Classify this reply. context["prepared_data"] carries the original
+      sequence + the lead's enrichment (pre_compose loaded the thread).
+
+      classified_as ∈ [positive, objection, question, out_of_office,
+      unsubscribe, referral, not_interested].
+      suggested_action: book | reply | suppress | nurture.
+      needs_human = true for positive / objection / question / referral.
+      auto_closeable = true for unsubscribe / out_of_office /
+      not_interested (logged + suppressed, no human time).
+      draft_response: a suggested reply when needs_human.
+
+      Echo reply_id, lead_id.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly
+      these keys:
+      {"reply_id": "", "lead_id": "", "classified_as": "", "suggested_action": "", "draft_response": "", "needs_human": false, "auto_closeable": false}
+    enforce_yields: true
+    enforce_yields_retry: 1
+    yields:
+      reply_id: "string"
+      lead_id: "string"
+      classified_as: "string"
+      suggested_action: "string"
+      draft_response: "string"
+      needs_human: "boolean"
+      auto_closeable: "boolean"
+    inputs:
+      reply_id: "string"
+    can_call:
+      - agent: "sdr_human"
+        condition: "calling_agent_response.needs_human == true"
+      - agent: "records_keeper_agent"
+        condition: "calling_agent_response.auto_closeable == true"
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.needs_human == false and calling_agent_response.auto_closeable == false"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.10 MEETING BOOKER (SYSTEM — calendar MCP) ─────────────────
+  meeting_scheduler_agent:
+    name: "meeting_scheduler_agent"
+    agent_type: "programmatic"
+    description: "Books the meeting on the calendar and confirms back"
+    communication_type: "chain"
+    integration: "mcp"
+    connector_config:
+      transport: "http"
+      url: "${CALENDAR_MCP_URL:}"
+      tool_name: "book_meeting"
+    yields:
+      lead_id: "string"
+      meeting_id: "string"
+      slot: "string"
+      booked_ok: "boolean"
+    inputs:
+      lead_id: "string"
+    can_call:
+      - agent: "records_keeper_agent"
+      - agent: "audit_logger_agent"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.11 CRM SYNC (SYSTEM — CRM MCP) ────────────────────────────
+  records_keeper_agent:
+    name: "records_keeper_agent"
+    agent_type: "programmatic"
+    description: "Writes campaign + outcome state to the CRM (Salesforce / HubSpot)"
+    communication_type: "chain"
+    integration: "mcp"
+    connector_config:
+      transport: "http"
+      url: "${CRM_MCP_URL:}"
+      tool_name: "upsert_record"
+    yields:
+      crm_record_id: "string"
+      synced_ok: "boolean"
+    inputs:
+      payload: "object"
+    can_call:
+      - agent: "audit_logger_agent"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── HUMAN GATES ─────────────────────────────────────────────────
+  growth_lead_human:
+    name: "growth_lead_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Approves a new/changed GTM before it drives offerings"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 86400         # 1 day
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "hold_for_review"
+      message: "hold_for_review"
+      note: "GTM reviewer did not respond — held"
+    yields:
+      decision: "string"
+      notes: "string"
+    inputs:
+      gtm_id: "string"
+      market_thesis: "string"
+    can_call:
+      - agent: "offer_architect_agent"
+        condition: "calling_agent_response.human_message == 'approve'"
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'approve'"
+
+  sales_lead_human:
+    name: "sales_lead_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Approves a campaign before it sends (spend + brand gate)"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 86400
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "hold_for_review"
+      message: "hold_for_review"
+      note: "Campaign approver did not respond — held (default-deny on send)"
+    yields:
+      decision: "string"
+      notes: "string"
+    inputs:
+      campaign_id: "string"
+      target_size: "number"
+      sequence_shape: "string"
+    can_call:
+      - agent: "prospector_agent"
+        condition: "calling_agent_response.human_message == 'approve'"
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'approve'"
+
+  sdr_human:
+    name: "sdr_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Reviews flagged replies; sends the response or triggers a booking"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 14400         # 4h
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "snooze"
+      message: "snooze"
+      note: "SDR reviewer did not respond — reply snoozed for later"
+    yields:
+      decision: "string"
+      notes: "string"
+    inputs:
+      reply_id: "string"
+      lead_id: "string"
+      draft_response: "string"
+      classified_as: "string"
+    can_call:
+      - agent: "meeting_scheduler_agent"
+        condition: "calling_agent_response.human_message == 'book'"
+      - agent: "campaign_launcher_agent"
+        condition: "calling_agent_response.human_message == 'send_reply'"
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'book' and calling_agent_response.human_message != 'send_reply'"
+
+  # ── AUDIT (external WORM, terminal) ─────────────────────────────
+  audit_logger_agent:
+    name: "audit_logger_agent"
+    agent_type: "external"
+    description: "Hash-chained WORM — every GTM/offering/campaign/reply/booking decision"
+    framework: "custom"
+    communication_type: "execute"
+    connector_config:
+      sink_type: "local_file"
+      local_file_path: "./logs/audit.jsonl"
+    yields:
+      audit_event_id: "string"
+      written_at_utc: "string"
+      hash_chain_prev: "string"
+      hash_chain_current: "string"
+    inputs:
+      session_id: "string"
+      payload: "object"
+    can_call: []
