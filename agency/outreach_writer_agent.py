@@ -26,6 +26,7 @@ from typing import Any
 from leafmesh import LeafMeshLogger, chain, pre_compose
 
 from agency._shared import store
+from agency._shared import session_stash
 
 logger = LeafMeshLogger(__name__)
 
@@ -34,7 +35,13 @@ _DEFAULTS: dict[str, Any] = {
     "leads_enriched": 0,
     "sequences_written": 0,
     "all_sequences_complete": False,
+    "enrichment_retry_exhausted": False,
 }
+
+# Bound the enrichment retry back-edge (Rule 3): at most this many re-runs
+# before the stall is escalated to the accountable owner — NEVER an unbounded
+# loop back into this agent.
+_MAX_ENRICHMENT_RETRIES = 2
 
 # Mirror the tool's default sequence shape so completeness is computed the
 # same way the loop tool counts it (steps per lead).
@@ -128,21 +135,34 @@ async def finalize_sequences(result: dict, ctx: dict) -> dict[str, Any]:
     status = _enrichment_status(campaign_id, list_id)
 
     # Deterministic floor: trust the store's count over the LLM's self-report.
+    # (These are recomputed from the GLOBAL store, so they are authoritative
+    # even under instances: N — never the summed per-copy self-reports.)
     result["campaign_id"] = campaign_id
     result["leads_enriched"] = status["leads_complete"]
     result["sequences_written"] = status["sequences_written"]
     result["all_sequences_complete"] = status["all_sequences_complete"]
 
-    if not status["all_sequences_complete"]:
-        logger.warning(
-            f"finalize_sequences — INCOMPLETE campaign={campaign_id} "
-            f"{status['leads_complete']}/{status['leads_total']} leads done, "
-            f"{status['sequences_written']} steps written"
-        )
-    else:
+    # Bound the retry back-edge (Rule 3): count re-runs per session; once the
+    # budget is spent, flip enrichment_retry_exhausted so the incomplete route
+    # goes to the accountable owner (terminal), never back into this agent.
+    if status["all_sequences_complete"]:
+        result["enrichment_retry_exhausted"] = False
         logger.info(
             f"finalize_sequences — complete campaign={campaign_id} "
             f"{status['leads_complete']} leads, {status['sequences_written']} steps"
+        )
+    else:
+        sid = str((ctx or {}).get("session_id", "")) or campaign_id or "_nosession"
+        attempts = session_stash.peek(sid, "enrichment_retries")
+        if attempts >= _MAX_ENRICHMENT_RETRIES:
+            result["enrichment_retry_exhausted"] = True
+        else:
+            session_stash.bump(sid, "enrichment_retries")
+            result["enrichment_retry_exhausted"] = False
+        logger.warning(
+            f"finalize_sequences — INCOMPLETE campaign={campaign_id} "
+            f"{status['leads_complete']}/{status['leads_total']} leads done, "
+            f"retries={attempts} exhausted={result['enrichment_retry_exhausted']}"
         )
     return result
 

@@ -42,7 +42,38 @@ def _steps_for(campaign_id: str) -> list[dict[str, Any]]:
     return shape if isinstance(shape, list) and shape else _DEFAULT_STEPS
 
 
-# ── Enrichment loop ──────────────────────────────────────────────────
+# ── Backlog fan-out: atomic claim (one batch per instance) ───────────
+@global_tool
+def claim_leads(campaign_id: str, list_id: str = "", batch: int = 4) -> dict[str, Any]:
+    """Atomically claim a DISJOINT batch of leads for THIS enrichment copy.
+
+    With instances: N, several copies of the writer run in parallel; each calls
+    this to grab its own batch so no lead is written twice. Returns the claimed
+    leads AND the sequence step plan. When the backlog is exhausted returns
+    done=true (claim empty). Announces available:false when there is no list to
+    claim from — never a fabricated lead.
+
+    Args:
+        campaign_id: The campaign whose list to claim from.
+        list_id: The lead list id (falls back to the campaign record).
+        batch: Max leads to claim in this call.
+    """
+    lid = list_id or store.get_campaign(campaign_id).get("list_id", "")
+    if not lid or not store.get_lead_list(lid):
+        return {"available": False, "done": True, "claimed": [], "count": 0,
+                "reason": "no lead list to claim from (source leads first / wire APOLLO_MCP_URL)"}
+    picked = store.claim_leads(campaign_id, lid, batch)
+    return {
+        "available": True,
+        "done": len(picked) == 0,
+        "claimed": picked,
+        "count": len(picked),
+        "steps": _steps_for(campaign_id),
+        "list_id": lid,
+    }
+
+
+# ── Enrichment loop (single-instance cursor; retained for direct use) ─
 @global_tool
 def next_enrichment_task(campaign_id: str, list_id: str = "") -> dict[str, Any]:
     """Return the NEXT {lead, step_no, channel, prior_steps} to write, or

@@ -156,4 +156,80 @@ def sequence_for(campaign_id: str, lead_id: str) -> list[dict[str, Any]]:
     return (_load("sequences").get(f"{campaign_id}:{lead_id}") or {}).get("steps", [])
 
 
+def sequences_complete(campaign_id: str, list_id: str, steps_per_lead: int) -> dict[str, Any]:
+    """Global completeness for a campaign's list — the authoritative count the
+    launcher's floor and the writer's @chain both read (never the LLM's
+    self-report)."""
+    leads = get_lead_list(list_id)
+    complete = 0
+    written = 0
+    for ld in leads:
+        n = len(sequence_for(campaign_id, ld.get("lead_id", "")))
+        written += n
+        if n >= steps_per_lead:
+            complete += 1
+    return {
+        "leads_total": len(leads),
+        "leads_complete": complete,
+        "sequences_written": written,
+        "all_complete": len(leads) > 0 and complete == len(leads),
+    }
+
+
+# ── Atomic lead claiming (fan-out across outreach_writer instances) ───
+#    Each instance calls claim_leads to pop a DISJOINT batch so copies never
+#    write the same lead twice. In-process + locked (dev); swap for a Redis
+#    SPOP / LPOP for multi-replica — the signature is the contract.
+def claim_leads(campaign_id: str, list_id: str, batch: int) -> list[dict[str, Any]]:
+    """Atomically claim up to `batch` unclaimed leads for this campaign.
+    Returns the claimed lead dicts ([] when the backlog is exhausted)."""
+    with _LOCK:
+        claims = _load("claims")
+        claimed_ids = set((claims.get(campaign_id) or {}).get("claimed", []))
+        leads = get_lead_list(list_id)
+        picked: list[dict[str, Any]] = []
+        for ld in leads:
+            lid = ld.get("lead_id", "")
+            if lid and lid not in claimed_ids:
+                picked.append(ld)
+                claimed_ids.add(lid)
+                if len(picked) >= max(1, int(batch or 1)):
+                    break
+        claims[campaign_id] = {"claimed": sorted(claimed_ids), "updated_at": _now()}
+        _save("claims", claims)
+        return picked
+
+
+# ── Launch tracking (no double-issue) + outbox + append-only ledger ───
+def is_launched(campaign_id: str) -> bool:
+    return bool(_load("launched").get(campaign_id))
+
+
+def mark_launched(campaign_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    with _LOCK:
+        store = _load("launched")
+        store[campaign_id] = {"launched_at": _now(), **record}
+        _save("launched", store)
+        return store[campaign_id]
+
+
+def record_outbox(entry: dict[str, Any]) -> dict[str, Any]:
+    with _LOCK:
+        outbox = _load("outbox")
+        rec = {"recorded_at": _now(), **entry}
+        outbox[_new_id("out")] = rec
+        _save("outbox", outbox)
+    return rec
+
+
+def append_ledger(entry: dict[str, Any]) -> dict[str, Any]:
+    """Append-only campaign ledger (dev mirror of the WORM sink for local demo)."""
+    with _LOCK:
+        ledger = _load("campaign_ledger")
+        rec = {"recorded_at": _now(), **entry}
+        ledger[_new_id("led")] = rec
+        _save("campaign_ledger", ledger)
+    return rec
+
+
 new_id = _new_id
