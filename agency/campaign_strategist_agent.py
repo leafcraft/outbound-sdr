@@ -114,6 +114,10 @@ async def persist_campaign(result: dict, ctx: dict) -> dict[str, Any]:
         "status": "approved" if result.get("approved") else "pending_approval",
     })
     result["campaign_id"] = campaign.get("campaign_id", result.get("campaign_id", ""))
+    # The approval request travels through a human seat, whose reply carries
+    # only the verdict — remember which campaign this session is about so the
+    # agent behind the gate can record the verdict against it.
+    store.bind_session(str((ctx or {}).get("session_id", "")), result["campaign_id"])
     logger.info(
         f"persist_campaign — campaign_id={result['campaign_id']} "
         f"requires_approval={result.get('requires_approval')} approved={result.get('approved')}"

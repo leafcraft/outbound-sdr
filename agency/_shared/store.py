@@ -126,6 +126,46 @@ def get_campaign(campaign_id: str) -> dict[str, Any]:
     return _load("campaigns").get(campaign_id, {})
 
 
+# ── Campaign approval (the send gate's verdict, on record) ───────────
+#    The Sales Lead's reply is the approval. It is written here by the first
+#    agent behind the gate (prospector_agent) from the reply itself, and the
+#    launcher's floor re-reads it. Persisted (not in-process): an approval can
+#    take a business day, and the app may restart in between.
+def bind_session(session_id: str, campaign_id: str) -> None:
+    """Remember which campaign a session's approval request is about."""
+    if not session_id or not campaign_id:
+        return
+    with _LOCK:
+        sessions = _load("sessions")
+        sessions[session_id] = {"campaign_id": campaign_id, "updated_at": _now()}
+        _save("sessions", sessions)
+
+
+def campaign_for_session(session_id: str) -> str:
+    return str((_load("sessions").get(session_id or "") or {}).get("campaign_id", ""))
+
+
+def record_approval(campaign_id: str, approver: str, verdict: str) -> dict[str, Any]:
+    """Record the approver's verdict on the campaign. Only 'approve' approves;
+    anything else leaves the campaign unapproved (status 'not_approved')."""
+    with _LOCK:
+        store = _load("campaigns")
+        camp = store.get(campaign_id)
+        if not camp:
+            return {}
+        ok = str(verdict or "").strip().lower() == "approve"
+        camp.update({
+            "approved": ok,
+            "status": "approved" if ok else "not_approved",
+            "approved_by": approver if ok else "",
+            "approval_verdict": str(verdict or ""),
+            "approval_recorded_at": _now(),
+        })
+        store[campaign_id] = camp
+        _save("campaigns", store)
+        return camp
+
+
 # ── Lead lists ───────────────────────────────────────────────────────
 def put_lead_list(list_id: str, campaign_id: str, leads: list[dict[str, Any]]) -> str:
     with _LOCK:
@@ -176,8 +216,8 @@ def sequences_complete(campaign_id: str, list_id: str, steps_per_lead: int) -> d
     }
 
 
-# ── Atomic lead claiming (fan-out across outreach_writer instances) ───
-#    Each instance calls claim_leads to pop a DISJOINT batch so copies never
+# ── Atomic lead claiming (fan-out across outreach_writer copies) ───
+#    Each copy calls claim_leads to pop a DISJOINT batch so copies never
 #    write the same lead twice. In-process + locked (dev); swap for a Redis
 #    SPOP / LPOP for multi-replica — the signature is the contract.
 def claim_leads(campaign_id: str, list_id: str, batch: int) -> list[dict[str, Any]]:

@@ -22,11 +22,11 @@ re-checks independently before anything is recorded downstream.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
-from leafmesh import LeafMeshLogger, chain
+from leafmesh import LeafMeshLogger, chain, connection_rows
+from leafmesh.vault.refs import UnresolvedVaultRef
 
 from agency._shared import store
 
@@ -76,8 +76,28 @@ def _steps_per_lead(campaign: dict) -> int:
     return _DEFAULT_STEPS
 
 
-def _connector_wired() -> bool:
-    return bool(os.getenv("SEQUENCER_MCP_URL"))
+SEQUENCER_RECORD = "sequencer_mcp"
+
+
+async def _connector_wired() -> bool:
+    """True when the vault record the sequencer connector uses exists.
+    UnresolvedVaultRef = no such record = not wired; any other error means
+    the record exists (it is just not ours to read as rows)."""
+    try:
+        await connection_rows(SEQUENCER_RECORD)
+        return True
+    except UnresolvedVaultRef:
+        return False
+    except PermissionError:  # SecretNotAllowed: the record exists; it only limits which agents read it
+        return True
+
+
+def _connector_ack(llm_response: Any) -> bool:
+    """True only when the sequencer connector actually ran and acknowledged:
+    the SDK hands this agent the connector's result, and a failed call comes
+    back as {"success": False, ...}. With the integration block commented out
+    (as shipped) there is no result, so nothing was sent."""
+    return isinstance(llm_response, dict) and llm_response.get("success") is True
 
 
 def _render_pack(campaign: dict, complete_leads: list[dict], real_send: bool) -> str:
@@ -101,7 +121,9 @@ def _render_pack(campaign: dict, complete_leads: list[dict], real_send: bool) ->
         )
     lines += ["", ("_Launched to the sequencer._" if real_send else
                    "_STAGED LOCALLY — no sequencer wired (real_send=false). "
-                   "Set SEQUENCER_MCP_URL and uncomment the connector to send._")]
+                   "Create the vault connection 'sequencer_mcp' (Infrastructure → "
+                   "Integrations → MCP) and uncomment the connector (Studio's YAML "
+                   "editor after the first start) to send._")]
     path.write_text("\n".join(lines), encoding="utf-8")
     return str(path)
 
@@ -206,7 +228,9 @@ async def campaign_launcher_agent(llm_response: Any, input_data: dict, context: 
     approved_provisional = bool(campaign.get("approved")) and signal not in _BLOCK_TOKENS
 
     if out["sequences_ready"] and approved_provisional and not store.is_launched(campaign_id):
-        real_send = _connector_wired()  # dev: staged locally, never a faked ack
+        # Launched = the record exists AND the connector acknowledged the send;
+        # a record alone (integration still commented) is staged, never "sent".
+        real_send = await _connector_wired() and _connector_ack(llm_response)
         out["artifact_path"] = _render_pack(campaign, complete_leads, real_send)
         out["launched"] = bool(real_send)
         out["status"] = "launched" if real_send else "staged"

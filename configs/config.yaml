@@ -8,7 +8,7 @@
 # triage -> a human works the reply to a booked meeting -> CRM record.
 #
 # The pod is a TEAM, not a pipeline. Every wire is conditional; every
-# hand-off is a finished contract; every human gate default-denies on
+# hand-off is a finished contract; nothing is sourced, sent or approved on
 # silence; the LAUNCHER is the finisher — it re-checks approval, enforces
 # invariants a human can't waive, renders the real launch pack, and fails
 # closed (delete-on-block). The WORM sink is the terminus. Systems (Apollo /
@@ -25,26 +25,18 @@ environment: "development"
 debug: true
 log_level: "INFO"
 
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    db: 0
-    password: "${REDIS_PASSWORD:}"
-    auto_storage: true
-    decode_responses: true
-    default_ttl: 86400
-    session_ttl: 2592000          # 30d — campaigns are long-lived
-
 auto_discover:
   directory: "./agency"
   pattern: "*_agent.py"
   recursive: false
 
-# The Manager is the SUPERVISOR — it watches every hand-off and escalates
-# stalls / contract violations / repeated errors to the Growth/RevOps Lead
-# (the accountable owner). It is not a router in the middle of the team.
+# The Manager is the SUPERVISOR — it escalates to the Growth/RevOps Lead (the
+# accountable owner) when an agent hits an error a retry cannot fix (auth, bad
+# request, credit, bad config), when 5 different agents fail in one session, or
+# when restarts run out. A contract violation raises an alert, not an
+# escalation. It does not chase an unanswered approval. The two real stall
+# routes are WIRES, not Manager rules: an incomplete sequence batch after its
+# retry budget, and a blocked launch, both go to the Growth/RevOps Lead.
 manager:
   model: "gpt-4o-mini"
   domain: "generic"
@@ -61,17 +53,16 @@ manager:
       - campaign_strategist_agent assembles the campaign; a human approves
         spend + brand before anything sends
       - prospector_agent sources leads; outreach_writer_agent writes
-        hyper-personalised multi-step sequences (fan-out across instances,
+        hyper-personalised multi-step sequences (fan-out across parallel copies,
         each claiming a disjoint batch)
       - campaign_launcher_agent is the FINISHER — it re-checks approval and
         launches only a complete, approved campaign; it fails closed
       - replies are pulled, triaged, and worked by a human to a meeting
-    Escalate to the Growth/RevOps Lead when:
-      - a new/changed GTM is unreviewed > 24h
-      - a campaign is pending approval > 24h
-      - enrichment stalls (sequences incomplete after the retry budget)
-      - the launcher blocks a campaign (unapproved / incomplete)
-    Silence never advances a campaign.
+    Escalate to the Growth/RevOps Lead when an agent fails in a way a retry
+    will not fix, or keeps failing. Enrichment stalls and blocked launches
+    already reach the Growth/RevOps Lead through their own wires. An approval
+    nobody answers is not escalated: the request waits its time and stops,
+    and nothing is sourced or sent on silence.
   routing:
     mode: "static"                # regulated send path — deterministic routing
   escalation:
@@ -81,15 +72,12 @@ manager:
     auto_escalate:
       max_retries: 3
       max_errors_per_session: 5
-      timeout_threshold: 2
-
-mesh:
-  call_timeout: 300               # research + enrichment are long-running
 
 # 2.4.131 runtime block — research + enrichment run long; the 2.4.131 default
 # llm hard timeout dropped to 90s, so raise it here. (The `timeouts` block is
 # rejected by <=2.4.130 — it must land WITH the 2.4.131 floor.)
 timeouts:
+  mesh_call_default_timeout_s: 300               # research + enrichment are long-running
   llm_hard_timeout_s: 300
 
 # ─────────────────────────────────────────────────────────────────────
@@ -269,15 +257,17 @@ agents:
              drives offerings — never let it flow downstream unreviewed.
         variables: [company_id]
     # Day-0 tool surface — dev stand-ins that announce themselves. To wire real
-    # research, uncomment the mcp block below (each named action becomes a tool).
+    # research, uncomment the mcp block below (each named action becomes a tool);
+    # here before the first start, in Studio's YAML editor after it.
     tools: ["web_research", "find_market_events"]
-    # ── Real research via MCP (SERP / Surfer). The SDK REJECTS an http mcp
-    #    block with an EMPTY url at load, so this ships COMMENTED — fill the
-    #    URL, then uncomment. The dev tools above are the day-0 fallback. ──
+    # ── Real research via MCP (SERP / Surfer). Create the vault connection
+    #    'serp_mcp' on Infrastructure → Integrations → MCP (the server's address +
+    #    token — entered only in the vault, never as url:/token: here), then
+    #    uncomment (here before the first start, in Studio's YAML editor after
+    #    it — applies live, no restart). The dev tools above are the day-0 fallback. ──
     # mcp:
-    #   - transport: http
-    #     url: "${SERP_MCP_URL}"
-    #     token: "${SERP_MCP_TOKEN:}"
+    #   - connection: serp_mcp
+    #     transport: http
     #     use: [search, fetch_page]
     #     name: serp
     #     timeout: 30
@@ -285,7 +275,7 @@ agents:
       gtm_id: "string"
       gtm_changed: "boolean"
       has_offering_candidate: "boolean"
-      offering_candidate_ids: "list"
+      offering_candidate_ids: {type: array, items: string}
       market_thesis: "string"
       idea_count: "number"
       version: "number"
@@ -367,7 +357,7 @@ agents:
 
   # ─────────────────────────────────────────────────────────────────────
   # campaign_strategist — Campaign Conductor (AI). Assembles a campaign from a
-  # GTM + offering. The human approval gate (spend + brand) lives on its
+  # GTM + offering. The human approval step (spend + brand) lives on its
   # outbound wire — requires_approval defaults TRUE, approved is read from the
   # human resume. Never sources or sends itself.
   # ─────────────────────────────────────────────────────────────────────
@@ -440,13 +430,14 @@ agents:
     agent_type: "programmatic"
     description: "Lead sourcing — pulls + validates the target list (Apollo in prod; dev store day-0)."
     communication_type: "chain"
-    # ── Real prospect data via Apollo MCP. Ships COMMENTED (an empty-url
-    #    connector is inert; fill APOLLO_MCP_URL in .env, then uncomment). The
-    #    programmatic body's dev-store path is the day-0 fallback. ──
+    # ── Real prospect data via Apollo MCP. Ships COMMENTED: create the vault
+    #    connection 'apollo_mcp' (Infrastructure → Integrations → MCP), then uncomment
+    #    (here before the first start, in Studio's YAML editor after it).
+    #    The programmatic body's dev-store path is the day-0 fallback. ──
     # integration: "mcp"
     # connector_config:
+    #   connection: apollo_mcp          # vault connection holds the address + token
     #   transport: "http"
-    #   url: "${APOLLO_MCP_URL}"
     #   tool_name: "search_people"
     yields:
       list_id: "string"
@@ -470,7 +461,7 @@ agents:
 
   # ─────────────────────────────────────────────────────────────────────
   # outreach_writer — Sequence Writer (AI, FAN-OUT). Writes a hyper-
-  # personalised multi-step sequence per lead. instances: 3 spins three
+  # personalised multi-step sequence per lead. scaling.copies.count: 3 spins three
   # parallel copies; each calls claim_leads to grab a DISJOINT batch so the
   # copies don't duplicate work. The looping tools drive; the model writes one
   # step at a time. @chain re-checks completeness from the store (the model
@@ -479,14 +470,17 @@ agents:
   outreach_writer_agent:
     name: outreach_writer_agent
     agent_type: "llm"
-    description: "Sequence writer — hyper-personalised multi-step sequences per lead; instances fan out over a claimed backlog."
+    description: "Sequence writer — hyper-personalised multi-step sequences per lead; parallel copies fan out over a claimed backlog."
     model: "claude-sonnet-4-6"
     temperature: 0.4
     max_completion_tokens: 2000
     max_tool_calls_per_message: 20   # long claim→write loop; the hard ceiling
     communication_type: "chain"
-    instances: 3                     # 3 parallel copies per activation
-    instances_handoff: last          # combine, then route once
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 3                     # 3 parallel copies per activation
+        handoff: last          # combine, then route once
     prompt: |
       You write outbound sequences, one step at a time. The TOOLS drive; you write.
 
@@ -555,12 +549,15 @@ agents:
     description: "Launcher (finisher) — re-checks approval, launches a complete campaign to the sequencer, renders the pack, fails closed."
     communication_type: "chain"
     # ── Real send via the sequencer (EmailBison / Instantly) MCP. Ships
-    #    COMMENTED (empty-url connector is inert; fill SEQUENCER_MCP_URL, then
-    #    uncomment). The dev-store path stages locally and announces itself. ──
+    #    COMMENTED: create the vault connection 'sequencer_mcp' (Infrastructure
+    #    → Integrations → MCP), then uncomment (here before the first start, in
+    #    Studio's YAML editor after it). The launcher treats the sequencer as
+    #    wired (real_send) as soon as that vault record exists. Until then the
+    #    dev-store path stages locally and announces itself. ──
     # integration: "mcp"
     # connector_config:
+    #   connection: sequencer_mcp          # vault connection holds the address + token
     #   transport: "http"
-    #   url: "${SEQUENCER_MCP_URL}"
     #   tool_name: "upload_campaign"
     yields:
       campaign_id: "string"
@@ -600,12 +597,13 @@ agents:
     timezone: "America/New_York"
     wake_up_input:
       trigger: pull_replies
-    # ── Real reply ingest via the mailbox MCP. Ships COMMENTED (empty-url
-    #    connector is inert; fill MAILBOX_MCP_URL, then uncomment). ──
+    # ── Real reply ingest via the mailbox MCP. Ships COMMENTED: create the
+    #    vault connection 'mailbox_mcp' (Infrastructure → Integrations → MCP), then
+    #    uncomment (here before the first start, in Studio's YAML editor after it). ──
     # integration: "mcp"
     # connector_config:
+    #   connection: mailbox_mcp          # vault connection holds the address + token
     #   transport: "http"
-    #   url: "${MAILBOX_MCP_URL}"
     #   tool_name: "fetch_replies"
     yields:
       replies: "list"
@@ -688,11 +686,13 @@ agents:
     agent_type: "programmatic"
     description: "Meeting booker — books the meeting and confirms back (Google/Cal.com in prod)."
     communication_type: "chain"
-    # ── Real booking via the calendar MCP. Ships COMMENTED. ──
+    # ── Real booking via the calendar MCP. Ships COMMENTED: create the vault
+    #    connection 'calendar_mcp' (Infrastructure → Integrations → MCP), then uncomment
+    #    (here before the first start, in Studio's YAML editor after it). ──
     # integration: "mcp"
     # connector_config:
+    #   connection: calendar_mcp          # vault connection holds the address + token
     #   transport: "http"
-    #   url: "${CALENDAR_MCP_URL}"
     #   tool_name: "book_meeting"
     yields:
       lead_id: "string"
@@ -718,11 +718,13 @@ agents:
     agent_type: "programmatic"
     description: "CRM sync — writes campaign + outcome state to the CRM (Salesforce/HubSpot in prod)."
     communication_type: "chain"
-    # ── Real CRM upsert via MCP. Ships COMMENTED. ──
+    # ── Real CRM upsert via MCP. Ships COMMENTED: create the vault connection
+    #    'crm_mcp' (Infrastructure → Integrations → MCP), then uncomment (here
+    #    before the first start, in Studio's YAML editor after it). ──
     # integration: "mcp"
     # connector_config:
+    #   connection: crm_mcp          # vault connection holds the address + token
     #   transport: "http"
-    #   url: "${CRM_MCP_URL}"
     #   tool_name: "upsert_record"
     yields:
       crm_record_id: "string"
@@ -736,101 +738,115 @@ agents:
     auto_store_yields: true
 
   # ─────────────────────────────────────────────────────────────────────
-  # Human members — first-class, reached in their own channel (webhook). Every
-  # gate DEFAULT-DENIES on silence: fallback_on_timeout -> held_for_review ->
-  # audit. `dual` belongs on the human/webhook boundary agent ONLY (a dual→dual
+  # Human members — first-class, answering in Studio's Inbox. If nobody answers
+  # within a seat's human_timeout_seconds, the request waits no longer: its
+  # Inbox card closes and the ticket records that no reply came. Nothing is
+  # sourced, sent or approved on silence, and nobody is chased automatically.
+  # fallback_on_timeout / fallback_response are the declared intent
+  # (held_for_review → audit); on SDK 2.4.486 a dual seat does not route them.
+  # Every seat's can_call covers every reply: the words it asks for, and a
+  # catch-all to audit for anything else. `dual` belongs on the human/webhook boundary agent ONLY (a dual→dual
   # wire is unbounded ping-pong the SDK warns on); every AI specialist is chain.
   # ─────────────────────────────────────────────────────────────────────
 
   growth_lead_human:
     name: growth_lead_human
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
-    human_timeout_seconds: 86400        # 1 day
+    human_timeout_seconds: 86400        # 24 h
     description: "Growth/RevOps Lead — accountable owner: approves a new/changed GTM, reviews stalls, launch blocks, and every escalation."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
-      max_retries: 1
-      retry_delay: 2
     yields:
-      human_message: "string"           # approve | held_for_review
+      human_message: "string"           # approve | reject | held_for_review
     inputs:
       gtm_id: "string"
       market_thesis: "string"
+    human_prompt_template: |
+      Either a new or materially changed GTM strategy needs your sign-off, or
+      the team needs you on a stalled or blocked campaign (details above).
+      For a GTM, reply with exactly one word:
+        approve  — the GTM may drive new offerings
+        reject   — it does not; the decision is recorded
+      For a stall or a blocked launch, reply with what you decided; it is
+      recorded, and you re-run start_campaign when it is fixed.
     can_call:
-      # GTM approved → build the offering.
+      # GTM approved → build the offering. Only a GTM sign-off request leads
+      # there: an "approve" on a stall or blocked launch is just recorded.
       - agent: "offer_architect_agent"
-        condition: "calling_agent_response.human_message == 'approve'"
-      # Held/unanswered (default-deny) or any exception → record it; the
-      # Manager supervisor drives further escalation.
+        condition: "calling_agent_response.human_message == 'approve' and calling_agent_response.from_agent == 'gtm_strategist_agent'"
+      # Everything else (reject, held, a decision on a stall/block) → record it.
       - agent: "audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message != 'approve' or calling_agent_response.from_agent != 'gtm_strategist_agent'"
 
   sales_lead_human:
     name: sales_lead_human
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
-    human_timeout_seconds: 86400
-    description: "Sales Lead — approves a campaign before it sends (spend + brand gate)."
+    human_timeout_seconds: 86400        # 24 h
+    description: "Sales Lead — approves a campaign before any lead is sourced or any email sent (spend + brand gate)."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     yields:
-      human_message: "string"           # approve | held_for_review
+      human_message: "string"           # approve | reject | held_for_review
     inputs:
       campaign_id: "string"
       target_size: "number"
       sequence_shape: "string"
+    human_prompt_template: |
+      A campaign plan is waiting for your approval (target size, sequence and
+      offering above). Reply with exactly one word:
+        approve  — leads are sourced and sequences written; the launcher
+                   re-checks your approval before anything is sent
+        reject   — nothing is sourced or sent; the decision is recorded
     can_call:
-      # Approved → source the leads.
+      # Approved → source the leads. The prospector writes this approval onto
+      # the campaign record; the launcher re-reads it before any send.
       - agent: "prospector_agent"
         condition: "calling_agent_response.human_message == 'approve'"
-      # Held/unanswered (default-deny on send) → record; nothing sends.
+      # Anything else (reject, held) → record; nothing is sourced or sent.
       - agent: "audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message != 'approve'"
 
   sdr_human:
     name: sdr_human
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
     human_timeout_seconds: 14400        # 4h
-    description: "SDR — works a flagged reply: book a meeting, send a reply, or hold."
+    description: "SDR — works a flagged reply: book a meeting, log a reply sent from their mailbox, or hold."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     yields:
-      human_message: "string"           # book | send_reply | held_for_review
+      human_message: "string"           # book | send_reply | hold | held_for_review
     inputs:
       reply_id: "string"
       lead_id: "string"
       draft_response: "string"
       classified_as: "string"
+    human_prompt_template: |
+      A prospect replied and it needs you (the reply, its classification and
+      a suggested response are above). Reply with exactly one word:
+        book        — book the meeting on the calendar
+        send_reply  — you sent the reply from your mailbox; log it to the CRM
+        hold        — do nothing now; the decision is recorded
     can_call:
       - agent: "meeting_scheduler_agent"
         condition: "calling_agent_response.human_message == 'book'"
+      # This pod sends nothing on this branch: the SDR replies from their own
+      # mailbox / sequencer and the outcome is written to the CRM.
       - agent: "records_keeper_agent"
         condition: "calling_agent_response.human_message == 'send_reply'"
       - agent: "audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message != 'book' and calling_agent_response.human_message != 'send_reply'"
 
   # ─────────────────────────────────────────────────────────────────────
   # WORM audit sink — hash-chained, append-only, the terminus of every path.
@@ -840,7 +856,7 @@ agents:
     name: audit_logger_agent
     agent_type: "external"
     framework: "custom"
-    communication_type: "execute"
+    communication_type: "chain"
     description: "WORM audit — hash-chains every GTM/offering/campaign/launch/reply/booking decision, AND every held gate. Terminus."
     connector_config:
       sink_type: "local_file"
