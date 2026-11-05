@@ -161,8 +161,8 @@ decision record).
 - → `audit_logger_agent` otherwise.
 **Yields.** `gtm_id, gtm_changed, has_offering_candidate, offering_candidate_ids[], market_thesis, idea_count, version, company_id`.
 **Tools.** `web_research(query)`, `find_market_events(company_id)`.
-**Integrations.** SERP/Surfer via `${SERP_MCP_URL:}` (research tool can
-be MCP-backed or a direct API tool).
+**Integrations.** SERP/Surfer via the vault connection `serp_mcp` (a
+commented `mcp:` row; the research tool can be MCP-backed or a direct API tool).
 
 ### 4.2 `offer_architect_agent` — offering & messaging architect (LLM)
 **Role.** Turn a strategy idea into a sellable, message-ready offering
@@ -219,7 +219,10 @@ campaign ref), to `sales_lead_human` (the human-readable plan).
 - → `sales_lead_human` when `requires_approval == true` (default
   true — spend + brand gate before anything sends).
 - → `prospector_agent` when `approved == true` (post-HITL resume).
-- → `audit_logger_agent` on reject/hold.
+- The Sales Lead's `approve` goes straight to `prospector_agent`, which
+  writes the approval onto the campaign record (`store.record_approval`,
+  only from the `sales_lead_human` reply) and sources nothing for an
+  unapproved campaign; anything else the Sales Lead says → audit.
 **Yields.** `campaign_id, gtm_id, offering_id, target_size, sequence_shape, requires_approval, approved, company_id`.
 **Tools.** `assemble_campaign(...)`.
 
@@ -227,7 +230,7 @@ campaign ref), to `sales_lead_human` (the human-readable plan).
 **Role.** Pull + validate the target lead list from Apollo (the system
 of record for prospect data).
 **Class.** `agent_type: programmatic`, `integration: mcp`,
-`connector_config` → `${APOLLO_MCP_URL:}`, tool `search_people`.
+`connector_config` → vault connection `apollo_mcp`, tool `search_people`.
 **`@sdk.intelligence`** — `shape_lead_list`: turn Apollo's raw response
 into the canonical lead-list yields; drop invalids; mark `validated`.
 **Triggers.** Called by `campaign_strategist_agent`; `direct_call_prospector`.
@@ -267,7 +270,7 @@ sequence; bound the loop (no infinite tool calls); summarise counts.
 **Role.** Push the built sequences into the email sequencer that sends
 and tracks them.
 **Class.** `programmatic` + `integration: mcp` →
-`${SEQUENCER_MCP_URL:}` (EmailBison / Instantly), tool `upload_campaign`.
+vault connection `sequencer_mcp` (EmailBison / Instantly), tool `upload_campaign`.
 **`@sdk.intelligence`** — `shape_upload_result`: map the sequencer's
 response (campaign ref, scheduled count) into yields.
 **Triggers.** Called by `campaign_strategist_agent` (post enrichment).
@@ -278,7 +281,7 @@ response (campaign ref, scheduled count) into yields.
 
 ### 4.7 `inbox_monitor_agent` — inbound ingest (SYSTEM, mailbox MCP, cron)
 **Role.** Pull new replies from the mailbox / sequencer.
-**Class.** `programmatic` + `integration: mcp` → `${MAILBOX_MCP_URL:}`,
+**Class.** `programmatic` + `integration: mcp` → vault connection `mailbox_mcp`,
 tool `fetch_replies`. `wake_up: "*/15 * * * *"` (every 15 min — commented
 until the connector is wired).
 **`@sdk.intelligence`** — `shape_replies`: normalise each reply.
@@ -308,14 +311,15 @@ trigger a booking. The one place a person works the actual conversation.
 **`human_interface: default`** (Studio inbox; Slack/email swappable).
 **Wires (route on `human_message`).**
 - → `meeting_scheduler_agent` when reply = `book`.
-- → `campaign_launcher_agent` when reply = `send_reply` (push the
-  approved response back through the sequencer).
-- → `audit_logger_agent` otherwise (`decline`/`snooze`).
+- → `records_keeper_agent` when reply = `send_reply` (the SDR sent the
+  reply from their own mailbox; the outcome is logged to the CRM — the pod
+  sends nothing on this branch).
+- → `audit_logger_agent` otherwise (`hold` or anything else).
 **Inputs.** `reply_id, lead_id, draft_response, classified_as`.
 
 ### 4.10 `meeting_scheduler_agent` — calendar (SYSTEM, calendar MCP)
 **Role.** Book the meeting and confirm back.
-**Class.** `programmatic` + `integration: mcp` → `${CALENDAR_MCP_URL:}`,
+**Class.** `programmatic` + `integration: mcp` → vault connection `calendar_mcp`,
 tools `find_slots`, `book_meeting`.
 **`@sdk.intelligence`** — `shape_booking`: map calendar response → yields.
 **Wires.** → `records_keeper_agent` always (log the meeting); →
@@ -324,7 +328,7 @@ tools `find_slots`, `book_meeting`.
 
 ### 4.11 `records_keeper_agent` — system of record (SYSTEM, CRM MCP)
 **Role.** Write campaign + outcome state to the CRM (Salesforce/HubSpot).
-**Class.** `programmatic` + `integration: mcp` → `${CRM_MCP_URL:}`.
+**Class.** `programmatic` + `integration: mcp` → vault connection `crm_mcp`.
 **`@sdk.intelligence`** — `shape_crm_ack`.
 **Wires.** → `audit_logger_agent` always.
 
@@ -332,8 +336,10 @@ tools `find_slots`, `book_meeting`.
 - `growth_lead_human` — signs off a **new/changed GTM** before it drives offerings.
 - `sales_lead_human` — approves a **campaign before send** (spend + brand).
 - `sdr_human` — works **replies** → response or booking.
-All default-deny on timeout (escalate/hold, never auto-proceed), route
-on `human_message`, no placeholder `operator_ids`.
+Nothing proceeds on silence: if nobody answers in time (24 h /
+24 h / 4 h), the Inbox card closes and the ticket records that no
+reply came; nobody is chased automatically. Each seat routes on
+`human_message` with a catch-all to audit, no placeholder `operator_ids`.
 
 ---
 
@@ -365,15 +371,19 @@ on `human_message`, no placeholder `operator_ids`.
 
 ---
 
-## 7. Integrations / connectors (env-var, commented until wired)
-| System | Used by | Env |
+## 7. Integrations / connectors (vault connection, commented until wired)
+Addresses and tokens are entered only in the vault (Infrastructure →
+Integrations → MCP, or an "Add custom" record with service type Tools whose base
+URL is the address); each block picks its record by name.
+
+| System | Used by | Vault connection |
 |---|---|---|
-| SERP / Surfer (web research) | gtm_strategist tools | `${SERP_MCP_URL:}` |
-| Apollo (prospect data) | lead_sourcing | `${APOLLO_MCP_URL:}` |
-| EmailBison / Instantly (sequencer) | sequence_uploader, sdr send-back | `${SEQUENCER_MCP_URL:}` |
-| Mailbox (reply ingest) | reply_puller | `${MAILBOX_MCP_URL:}` |
-| Calendar (Google / Cal.com) | meeting_booker | `${CALENDAR_MCP_URL:}` |
-| CRM (Salesforce / HubSpot) | crm_sync | `${CRM_MCP_URL:}` |
+| SERP / Surfer (web research) | gtm_strategist tools | `serp_mcp` |
+| Apollo (prospect data) | lead_sourcing | `apollo_mcp` |
+| EmailBison / Instantly (sequencer) | sequence_uploader, sdr send-back | `sequencer_mcp` |
+| Mailbox (reply ingest) | reply_puller | `mailbox_mcp` |
+| Calendar (Google / Cal.com) | meeting_booker | `calendar_mcp` |
+| CRM (Salesforce / HubSpot) | crm_sync | `crm_mcp` |
 
 Connector crons ship **commented out** ("enable after wiring your X
 connector"). A `_shared/store.py` gives a local JSON dev fallback so the
@@ -391,8 +401,7 @@ before any connector exists.
 2. **Added `sales_lead_human` as a default send gate.** You said
    humans are in the loop "ensuring it's all running" — for an outbound
    motion the load-bearing gate is *before money/brand goes out the
-   door*, so a campaign approval gate is default-on (toggle off for
-   full-auto).
+   door*, so a campaign approval step is always on.
 3. **Added `records_keeper_agent`.** The operation produces outcomes
    (campaign live, meeting booked) that belong in the CRM; without it,
    results live only in the audit log.

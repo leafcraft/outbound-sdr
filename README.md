@@ -33,7 +33,7 @@ gates every campaign.
 | `gtm_strategist_agent` | Team head | Research the onboarded company → a GTM strategy doc; sweep for new ideas/events weekly | LLM; web-research tool (SERP — stub until wired); routes to offer_architect; wake_up sweeps |
 | `offer_architect_agent` | Offer designer | Turn GTM ideas into concrete offerings + A/B × persona × industry variants | LLM; routes to campaign_strategist |
 | `campaign_strategist_agent` | Campaign conductor | Assemble a campaign (offering + audience + sequence plan) and drive it | LLM; orchestrates prospector → outreach_writer → launcher |
-| `outreach_writer_agent` | Sequence writer | Write per-lead, multi-step, personalised sequences | LLM + **looping enrichment tool** (tool drives the loop, one step per lead) |
+| `outreach_writer_agent` | Sequence writer | Write per-lead, multi-step, personalised sequences | LLM + **looping enrichment tool** (tool drives the loop, one step per lead); 3 parallel copies (`scaling.copies.count: 3`), each claiming a disjoint batch with `claim_leads` |
 | `reply_triager_agent` | Reply classifier | Classify each inbound reply (interested / objection / OOO / unsubscribe) and propose the next action | LLM; routes to sdr_human / scheduler |
 | `prospector_agent` | Lead sourcing | Pull + validate the target lead list | Programmatic (MCP — Apollo) |
 | `campaign_launcher_agent` | Sequencer | Ship the approved sequences | Programmatic (MCP — EmailBison/Instantly) |
@@ -44,6 +44,9 @@ gates every campaign.
 | `sales_lead_human` | Campaign approver | Approve a campaign before anything sends (spend + brand) | Human gate |
 | `sdr_human` | Reply worker | Work each reply that needs judgment → response or booking | Human gate |
 | `audit_logger_agent` | WORM audit | Hash-chain every decision + send | External (custom sink); terminus |
+
+2.4.484's `scaling.copies.mode: auto` with `claim_tool: claim_leads` could replace
+the writer's manual backlog split — an owner decision, not made in this template.
 
 ## Configuration — what to set, in three tiers
 
@@ -64,37 +67,39 @@ connector URL.
 | `OPENAI_API_KEY` | The Manager model | **Required** unless you change `manager.model`. |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | State store | Defaults to `localhost:6379`. `docker run -d -p 6379:6379 redis:7-alpine`. |
 
-### Tier 2 — connectors (set the URL and the step goes live)
+### Tier 2 — connectors (a vault connection, then uncomment the block)
 
-These five are real MCP `connector_config` URLs — the SDK activates each
-when its URL is set; the agent stays on its dev stand-in until then:
+Each system's address + token is entered **only in the vault** (Studio →
+Infrastructure → Integrations → MCP, or an "Add custom" record with service type
+Tools whose base URL is the address) — the SDK refuses a `url:` / `token:` written in
+the config, even as `${ENV_VAR}`. Each agent's connector block ships
+**commented** in `configs/config.yaml`, already picking its connection by name;
+create the connection, then uncomment it — in `configs/config.yaml` before the
+first start, in Studio's YAML editor after it (see *Changing the configuration
+after the first start*). The agent stays on its dev stand-in until then:
 
-| Setting | Enables | Used by |
+| Vault connection | Enables | Used by |
 |---|---|---|
-| `APOLLO_MCP_URL` | Real prospect data + validation | prospector |
-| `SEQUENCER_MCP_URL` | Ship sequences via EmailBison / Instantly | campaign_launcher |
-| `MAILBOX_MCP_URL` | Pull real replies | inbox_monitor |
-| `CALENDAR_MCP_URL` | Book real meetings (Google / Cal.com) | meeting_scheduler |
-| `CRM_MCP_URL` | Write campaigns + outcomes (Salesforce / HubSpot) | records_keeper |
+| `apollo_mcp` | Real prospect data + validation | prospector |
+| `sequencer_mcp` | Ship sequences via EmailBison / Instantly | campaign_launcher |
+| `mailbox_mcp` | Pull real replies | inbox_monitor |
+| `calendar_mcp` | Book real meetings (Google / Cal.com) | meeting_scheduler |
+| `crm_mcp` | Write campaigns + outcomes (Salesforce / HubSpot) | records_keeper |
+| `serp_mcp` | Web research (SERP / Surfer) as MCP tools | gtm_strategist (its commented `mcp:` block) |
 
-> ⚠️ **`SERP_MCP_URL` is different.** The GTM research tool in
-> `agency/tools/tools.py` ships as a **dev stub that returns no results and
-> does not read the var** — setting `SERP_MCP_URL` alone won't enable
-> research. Wire the tool body to your SERP/Surfer MCP first. It's in
-> `.env` to mark the intended integration point.
+> The launcher treats the sequencer as wired (`real_send`) as soon as the vault
+> record `sequencer_mcp` exists — nothing in `.env`. Until then it stages the
+> launch pack in `./out/` and says so. The day-0 `web_research` tool in `agency/tools/tools.py` is a **dev stub
+> that returns no results** — real research comes from the `serp_mcp` tools
+> (or wire that tool body to your SERP/Surfer API).
 
 ### Tier 3 — direct email channel (alternative to the sequencer/mailbox MCPs)
 
 To send + ingest over your own SMTP/IMAP instead of a sequencer platform,
-**uncomment the `channels:` blocks** in `configs/config.yaml` and set:
-
-| Setting | What it's for |
-|---|---|
-| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `FROM_ADDRESS` | Outbound send |
-| `IMAP_HOST` / `IMAP_USER` / `IMAP_PASSWORD` | Reply ingest |
-
-> The channel blocks ship **commented out** — an empty SMTP host is
-> rejected at boot. Leave them commented to run on Tier 1/2.
+create an **email connection in the vault** (SMTP/IMAP host, user, password —
+never in `.env` or the config) and add a `channels: {email: {connection:
+<name>}}` block on the sending agent. This template ships no `channels:`
+block; leave it out to run on Tier 1/2.
 
 ## Run it
 
@@ -128,18 +133,138 @@ curl -X POST http://127.0.0.1:18820/api/mesh/call \
 
 In dev mode the LLM chain (GTM → offering → campaign → enrichment) runs
 against the local store; wire the Tier 2 connectors above to make each
-step real.
+step real. The GTM sign-off, campaign approval and reply review land in
+**Studio → Inbox** — answer them there.
 
 ## The control gates
 
 - **GTM sign-off** — a *new or materially-changed* GTM goes to a human
   before it drives offerings (routine appends stay autonomous).
-- **Campaign approval** — default-on gate before anything sends
-  (spend + brand). Toggle off for full-auto.
+- **Campaign approval** — the Sales Lead approves before any lead is
+  sourced or any email sent (spend + brand). The approval is written onto
+  the campaign record by the first agent behind the gate, and the launcher
+  re-reads it before anything is staged or sent; an unapproved campaign
+  sources nothing. There is no switch to turn it off.
 - **Reply review** — every reply that needs judgment is worked by a
-  human, who sends the response or triggers the booking.
+  human: `book` triggers the booking; `send_reply` logs a reply the SDR sent
+  from their own mailbox to the CRM (the pod sends nothing on that branch);
+  anything else is recorded.
+- **Silence** — if nobody answers a gate in time (Growth Lead and Sales
+  Lead: 24 h; SDR: 4 h), the request waits no longer: its Inbox
+  card closes and the ticket records that no reply came. Nothing is sourced,
+  sent or approved on silence, and nobody is chased automatically.
+- **The Manager** escalates to the Growth/RevOps Lead only when an agent
+  hits an error a retry cannot fix, when 5 different agents fail in one
+  session, or when restarts run out. Enrichment stalls (after the retry
+  budget) and blocked launches reach the Growth/RevOps Lead by their own
+  wires.
 - **Audit** — every decision lands in the hash-chained WORM log.
 
 ---
 
 *Built with `create-leafmesh`. The config is the department; the PRD is the brief.*
+
+## Changing the configuration after the first start
+
+`configs/config.yaml` is only the first-start seed. On the first start (an empty store) the agency imports it as version 1 and from then on keeps its configuration in the store. After that the file is not read again: an edit to it is **not** applied, even after a restart (the boot log says "that edit was NOT applied").
+
+To change a running agency:
+
+- **Studio** — its settings pages, or the raw YAML editor.
+- **API** — `PUT /api/yaml/raw` with an `X-API-Key` header and the body `{"yaml_content": "<the whole YAML>", "save_to_disk": true}`, or `PATCH /api/yaml/config` with `{"updates": {...}, "save_to_disk": true}`.
+
+Each save is a new version and applies live on every pod — no restart. (A few settings, such as brokers, make the agency reload itself in place within seconds.) So wherever this README or a comment says "uncomment X in `configs/config.yaml`", do it in the file before the first start, or in Studio's YAML editor after it.
+
+## Changing a running project (Docker)
+
+What reaches a project that is already running (leafmesh 2.4.497). The
+image holds the Python code and the first-start `configs/config.yaml`;
+`.env` is passed in when the container is created; the store (Redis) keeps
+its data on its own volume.
+
+| You change | When it applies |
+|---|---|
+| An agent in Studio (prompt, model, tools, routes, human seats, schedules, …) | At once, no restart |
+| A human seat's `channels` (Slack, email, …) | The agency reloads itself in place within seconds |
+| Add or delete an agent in Studio | At once, including routes and schedules |
+| A connection in the vault (model keys, MCP, webhooks, connectors, Slack, email) | At once. An agent switched off for a missing connection or address switches back on by itself |
+| Anything in `.env` (licence, agency name, store, ports) | After `docker compose up -d` (the container is recreated) |
+| Python code (`agency/*.py`: programmatic agents, tools, `@pre_compose`) | After a rebuild: `docker compose up -d --build` |
+| `configs/config.yaml` | Never after the first start. It is read only when the store is empty |
+| Several app containers on one store | A Studio save reaches every one within about 15 seconds |
+
+- Keep model keys in the vault. A key there wins over the same key in
+  `.env` (the log warns), and a change applies at once. From 2.4.497 that
+  holds for every value the vault holds (endpoints, organisation / project
+  ids, cloud identities); the `.env` value returns when the record goes.
+- Code the image does not have: an agent marked pure Python
+  (`integration: python`) is switched off until its function is in the image;
+  any other programmatic agent stays on, and each call to code it does not
+  have fails. Rebuild the image with the code first.
+- A new Redis volume is an empty store, so `configs/config.yaml` is imported
+  again as version 1.
+- **If the agency refuses to start after an upgrade** (a new leafmesh pin,
+  then a rebuild: "Configuration has N error(s) in the stored
+  configuration"), repair the stored configuration with the agency stopped:
+
+  ```bash
+  docker compose run --rm sales-orchestration leafmesh config check      # each problem, with its line
+  docker compose run --rm sales-orchestration leafmesh config versions   # kept versions: which pass, which is in use
+  docker compose run --rm sales-orchestration leafmesh config rollback   # back to the newest version that passes (saved as a new version)
+  ```
+
+  Or `leafmesh config export > config.yaml`, fix it by hand, then
+  `leafmesh config import config.yaml` (it is checked before it is saved).
+
+## Where the data store is set
+
+From leafmesh 2.4.482 the store (Redis or Postgres) is set **only in `.env`** — never in `configs/config.yaml`. A `persistence:` block in the YAML is ignored with a warning on leafmesh 2.4.482–2.4.485; from 2.4.486 the agency refuses to start if that block differs from `.env`, and names each `.env` line to add. The project's `.env` sets the store explicitly (`LEAFMESH_STORE`, `LEAFMESH_AGENCY_NAME`, `REDIS_*`).
+
+- Redis (default): `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_DB`; optional `REDIS_DEFAULT_TTL`, `REDIS_SESSION_TTL`, `REDIS_SSL*`, `REDIS_CLUSTER_NODES`.
+- Postgres instead: `LEAFMESH_STORE=postgres` plus `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (optional `POSTGRES_SSLMODE`).
+- Or the whole server in one value: `REDIS_URL=redis://user:pw@host:6379/0` (`rediss://` turns TLS on) or `DATABASE_URL=postgresql://user:pw@host:5432/db`. The single names fill in what the URL leaves out.
+- With Docker Compose the app reaches Redis as `redis` (the service name); compose sets that for you.
+- Check it in Studio → **Infrastructure → Datastores**: it shows whether the store is reachable (never the address or password).
+
+## This mesh's sign-in (leafmesh 2.4.497)
+
+From leafmesh 2.4.497 each mesh signs in to LeafCraft with its own key, not
+a key shared by every install.
+
+- **First start.** The mesh makes a key pair and registers it with
+  `LEAFMESH_LICENSE_KEY` and `LEAFMESH_ENV_TOKEN` from `.env` (copy the
+  environment token from Studio — a placeholder such as `development` is
+  refused). With both valid it works at once. If your organisation turned on
+  "require approval", the first start stops and says so: approve it in
+  Studio → **Keys → SDK access**, then start again. Organisation admins get an
+  email for every new registration.
+- **Where the key lives.** In the vault, in the store, encrypted with
+  `LEAFMESH_VAULT_KEY`: it survives rebuilds and every copy of the app shares
+  it. A new Redis volume, or a new vault key, makes a new key pair that
+  registers again — revoke the old one in Studio.
+- **Check or change it** (in Docker: `docker compose run --rm sales-orchestration leafmesh auth status`):
+  - `leafmesh auth status` — credential id, key fingerprint, registration and
+    mode, never a key; `--check` signs in now and reports the tokens.
+  - `leafmesh auth register` — register now.
+  - `leafmesh auth rotate` — a new key pair: once it is active the mesh
+    switches to it and revokes the old one. A revoked or expired key is never
+    revived; rotate instead.
+- **Lost the environment token?** From 5 Dec 2026 Studio shows the licence
+  key and environment token only once, when they are made (then only a hint).
+  Rotate the environment token in Studio and put the new one in `.env`.
+  Rotating it changes where the agency's data is kept in the store, so do it
+  before the agency holds data.
+- **An existing project whose `.env` says `LEAFMESH_ENV_TOKEN=development`.**
+  2.4.497 needs the real token. The token also names where the agency's data
+  sits in the store, so with the real token the agency starts on an empty
+  store (vault, sessions, board) — the old data stays under the old name. Set
+  the real token before you put data in the agency, or contact us to move it.
+
+## Your vault key — back it up
+
+`create-leafmesh` put a `LEAFMESH_VAULT_KEY` in your `.env` when it made this project. It is the master key that encrypts every connection and credential you store in the vault (in Redis / Postgres).
+
+- **Back it up like a master password.** Lose it and every stored connection has to be entered again.
+- **Never change or regenerate it** for an existing project — a new key locks the existing vault. To change it, use `leafmesh vault rotate-key`.
+- Every copy of the app (every replica) must get the **same** value. Docker Compose passes it in from `.env` as an environment variable.
+- Never commit `.env` (it is already in `.gitignore`).

@@ -6,7 +6,14 @@ canonical lead-list yields (@sdk.intelligence role) — dropping invalids
 and marking validated. Dev: returns a local-store stand-in — a small
 synthetic, validated lead list written to _shared/store.put_lead_list so
 the chain (campaign → sourcing → enrichment) runs day-0 before the
-APOLLO_MCP_URL connector is wired.
+vault connection 'apollo_mcp' is created and its connector block uncommented.
+
+The send gate, on record: this is the first agent behind the Sales Lead's
+approval. The seat's reply carries only the verdict, so this agent recovers
+the campaign for the session, writes the verdict onto the campaign
+(store.record_approval), and sources leads ONLY for a campaign approved on
+record. An unapproved campaign gets lead_count 0 (→ audit); nothing is
+sourced, written or sent. The launcher re-reads the same record.
 
 Yields (config.yaml): list_id, campaign_id, lead_count, leads, validated.
 """
@@ -71,7 +78,7 @@ def _pick(input_data: dict[str, Any], key: str, default: Any) -> Any:
 def _email(name: str, company: str) -> str:
     first = name.split()[0].lower()
     domain = "".join(ch for ch in company.lower() if ch.isalnum())
-    return f"{first}@{domain}.com"
+    return f"{first}@{domain}.example"   # fictional — never a real domain
 
 
 def _shape_connector_leads(raw: dict[str, Any], campaign_id: str) -> list[dict[str, Any]]:
@@ -131,7 +138,7 @@ def _synth_leads(target_size: int, icp_filter: dict[str, Any]) -> list[dict[str,
             "title": title,
             "company": company,
             "email": _email(name, company),
-            "linkedin": f"https://linkedin.com/in/{name.replace(' ', '').lower()}",
+            "linkedin": f"https://linkedin.example/in/{name.replace(' ', '').lower()}",
             "firmographics": {
                 "industry": industry_hint or industry,
                 "employee_count": size,
@@ -141,13 +148,37 @@ def _synth_leads(target_size: int, icp_filter: dict[str, Any]) -> list[dict[str,
     return leads
 
 
+APPROVER = "sales_lead_human"
+
+
+def _verdict(input_data: dict[str, Any]) -> tuple[str, str]:
+    """(verdict, who) — the Sales Lead's reply, if this call follows it."""
+    msg = str(_pick(input_data, "human_message", "") or "").strip().lower()
+    who = str(_pick(input_data, "source_agent", "") or "")
+    return msg, who
+
+
 async def prospector_agent(llm_response, input_data, context):
     """Pull + validate a target lead list. Connector path shapes Apollo's
     response; dev path synthesizes a small validated list into the store."""
     input_data = input_data or {}
-    campaign_id = _pick(input_data, "campaign_id", "")
-    icp_filter = _pick(input_data, "icp_filter", {}) or {}
-    target_size = _pick(input_data, "target_size", 0)
+    sid = str((context or {}).get("session_id", "") or "")
+    campaign_id = _pick(input_data, "campaign_id", "") or store.campaign_for_session(sid)
+
+    verdict, who = _verdict(input_data)
+    # Only the Sales Lead's own reply counts — a payload that merely says
+    # "approve" (e.g. through the direct-call door) does not approve anything.
+    if campaign_id and verdict and who == APPROVER:
+        store.record_approval(campaign_id, APPROVER, verdict)
+    campaign = store.get_campaign(campaign_id) if campaign_id else {}
+    if not campaign.get("approved"):
+        logger.warning(
+            f"prospector_agent — campaign={campaign_id!r} is not approved on record; "
+            f"nothing sourced (fail closed)")
+        return {**_DEFAULTS, "campaign_id": campaign_id}
+
+    icp_filter = _pick(input_data, "icp_filter", {}) or campaign.get("icp_filter") or {}
+    target_size = _pick(input_data, "target_size", 0) or campaign.get("target_size", 0)
 
     # When a connector is configured the SDK passes its raw response as the
     # first arg — a dict means "shape this" (@sdk.intelligence role).
@@ -160,6 +191,7 @@ async def prospector_agent(llm_response, input_data, context):
 
     list_id = store.new_id("list")
     store.put_lead_list(list_id, campaign_id, leads)
+    store.put_campaign({"campaign_id": campaign_id, "list_id": list_id})
     logger.info(
         f"prospector_agent — {len(leads)} validated leads ({source}) "
         f"for campaign={campaign_id!r}, list={list_id}"
