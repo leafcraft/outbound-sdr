@@ -136,7 +136,7 @@ async def finalize_sequences(result: dict, ctx: dict) -> dict[str, Any]:
 
     # Deterministic floor: trust the store's count over the LLM's self-report.
     # (These are recomputed from the GLOBAL store, so they are authoritative
-    # even under instances: N — never the summed per-copy self-reports.)
+    # even under scaling.copies.count: N — never the summed per-copy self-reports.)
     result["campaign_id"] = campaign_id
     result["leads_enriched"] = status["leads_complete"]
     result["sequences_written"] = status["sequences_written"]
