@@ -1,13 +1,13 @@
 """inbox_monitor_agent — inbound ingest (SYSTEM, connector-backed, cron).
 
-Production: the mailbox connector (integration: mcp in config.yaml, tool
+Production: the mailbox connector (integration: mcp in the configuration, tool
 fetch_replies; IMAP/sequencer inbound) runs and this normalises each
 returned message into a canonical reply dict (@sdk.intelligence role).
 Dev: returns a local-store stand-in — an empty reply list, because there
-is no real mailbox to pull from until the MAILBOX_MCP_URL connector is
+is no real mailbox to pull from until the vault connection 'mailbox_mcp' is
 wired. This lets the cron entry point (pull_replies) run inertly day-0.
 
-Yields (config.yaml): replies, reply_count.
+Yields (set in the configuration): replies, reply_count.
 """
 from __future__ import annotations
 

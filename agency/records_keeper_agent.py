@@ -1,13 +1,13 @@
 """records_keeper_agent — system of record (SYSTEM, connector-backed).
 
-Production: the CRM connector (integration: mcp in config.yaml, tool
+Production: the CRM connector (integration: mcp in the configuration, tool
 upsert_record; Salesforce / HubSpot) runs and this shapes its upsert
 acknowledgement into yields (@sdk.intelligence role). Dev: returns a
 local-store stand-in — a synthetic crm_record_id and a synced_ok ack, so
-campaign/outcome state has a terminus day-0 before the CRM_MCP_URL
-connector is wired.
+campaign/outcome state has a terminus day-0 before the vault
+connection 'crm_mcp' is wired.
 
-Yields (config.yaml): crm_record_id, synced_ok.
+Yields (set in the configuration): crm_record_id, synced_ok.
 """
 from __future__ import annotations
 

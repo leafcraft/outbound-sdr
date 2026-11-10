@@ -1,13 +1,13 @@
 """meeting_scheduler_agent — calendar (SYSTEM, connector-backed).
 
-Production: the calendar connector (integration: mcp in config.yaml, tool
+Production: the calendar connector (integration: mcp in the configuration, tool
 book_meeting; Google Calendar / Cal.com) runs and this maps its booking
 response into yields (@sdk.intelligence role). Dev: returns a local-store
 stand-in — a synthetic meeting_id and a placeholder ISO slot marked
 booked, so the human → booking chain runs day-0 before the
-CALENDAR_MCP_URL connector is wired.
+vault connection 'calendar_mcp' is wired.
 
-Yields (config.yaml): lead_id, meeting_id, slot, booked_ok.
+Yields (set in the configuration): lead_id, meeting_id, slot, booked_ok.
 """
 from __future__ import annotations
 

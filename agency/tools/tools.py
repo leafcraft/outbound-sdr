@@ -42,12 +42,12 @@ def _steps_for(campaign_id: str) -> list[dict[str, Any]]:
     return shape if isinstance(shape, list) and shape else _DEFAULT_STEPS
 
 
-# ── Backlog fan-out: atomic claim (one batch per instance) ───────────
-@global_tool
+# ── Backlog fan-out: atomic claim (one batch per copy) ───────────────
+@global_tool()
 def claim_leads(campaign_id: str, list_id: str = "", batch: int = 4) -> dict[str, Any]:
     """Atomically claim a DISJOINT batch of leads for THIS enrichment copy.
 
-    With instances: N, several copies of the writer run in parallel; each calls
+    With scaling.copies.count: N, several copies of the writer run in parallel; each calls
     this to grab its own batch so no lead is written twice. Returns the claimed
     leads AND the sequence step plan. When the backlog is exhausted returns
     done=true (claim empty). Announces available:false when there is no list to
@@ -61,7 +61,7 @@ def claim_leads(campaign_id: str, list_id: str = "", batch: int = 4) -> dict[str
     lid = list_id or store.get_campaign(campaign_id).get("list_id", "")
     if not lid or not store.get_lead_list(lid):
         return {"available": False, "done": True, "claimed": [], "count": 0,
-                "reason": "no lead list to claim from (source leads first / wire APOLLO_MCP_URL)"}
+                "reason": "no lead list to claim from (source leads first / wire the vault connection 'apollo_mcp')"}
     picked = store.claim_leads(campaign_id, lid, batch)
     return {
         "available": True,
@@ -73,8 +73,8 @@ def claim_leads(campaign_id: str, list_id: str = "", batch: int = 4) -> dict[str
     }
 
 
-# ── Enrichment loop (single-instance cursor; retained for direct use) ─
-@global_tool
+# ── Enrichment loop (single-copy cursor; retained for direct use) ─────
+@global_tool()
 def next_enrichment_task(campaign_id: str, list_id: str = "") -> dict[str, Any]:
     """Return the NEXT {lead, step_no, channel, prior_steps} to write, or
     {"done": true} when every lead × every step is complete. The job is
@@ -114,7 +114,7 @@ def next_enrichment_task(campaign_id: str, list_id: str = "") -> dict[str, Any]:
     }
 
 
-@global_tool
+@global_tool()
 def write_sequence_step(campaign_id: str, lead_id: str, step_no: int,
                         channel: str, subject: str, body: str,
                         personalization_basis: str = "") -> dict[str, Any]:
@@ -126,7 +126,7 @@ def write_sequence_step(campaign_id: str, lead_id: str, step_no: int,
     return {"saved": True, "lead_id": lead_id, "step_no": step_no}
 
 
-@global_tool
+@global_tool()
 def enrichment_status(campaign_id: str, list_id: str = "") -> dict[str, Any]:
     """Report completeness across the list × steps."""
     lid = list_id or store.get_campaign(campaign_id).get("list_id", "")
@@ -148,21 +148,21 @@ def enrichment_status(campaign_id: str, list_id: str = "") -> dict[str, Any]:
 
 
 # ── GTM research tools (dev stand-ins) ───────────────────────────────
-@global_tool
+@global_tool()
 def web_research(query: str) -> dict[str, Any]:
     """Internet research (SERP/Surfer). Dev stub returns an empty,
-    clearly-marked result; wire ${SERP_MCP_URL} for live research."""
+    clearly-marked result; wire the vault connection 'serp_mcp' for live research."""
     logger.info(f"[web_research] {query!r} (dev stub — wire SERP/Surfer)")
-    return {"query": query, "results": [], "note": "dev stub — wire SERP_MCP_URL"}
+    return {"query": query, "results": [], "note": "dev stub — wire the vault connection 'serp_mcp'"}
 
 
-@global_tool
+@global_tool()
 def find_market_events(company_id: str) -> dict[str, Any]:
     """Relevant market/company events for the weekly GTM sweep (dev stub)."""
     return {"company_id": company_id, "events": [], "note": "dev stub — wire your events source"}
 
 
-@global_tool
+@global_tool()
 def assemble_campaign(gtm_id: str, offering_id: str, target_size: int = 100,
                       sequence_shape: str = "3xemail+linkedin") -> dict[str, Any]:
     """Lock a campaign plan and persist it."""
